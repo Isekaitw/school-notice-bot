@@ -7,6 +7,13 @@ on:
     - cron: '0 * * * *'
   workflow_dispatch:  # 允許在 GitHub 網頁上手動觸發，方便測試
 
+concurrency:
+  group: school-notice-bot
+  cancel-in-progress: false
+  # 確保同一時間只有一個執行實例在跑，避免 GitHub 補跑積欠排程時
+  # 好幾個執行同時搶著讀寫 last_checked.json / pending_matches.json，
+  # 導致互相看不到對方最新的狀態、誤判成好幾次獨立的發送時機
+
 permissions:
   contents: write  # 需要寫入權限才能 commit 回 last_checked.json / pending_matches.json
 
@@ -42,3 +49,4 @@ jobs:
           git add last_checked.json pending_matches.json
           git diff --staged --quiet || git commit -m "chore: update state files [skip ci]"
           git push
+        
