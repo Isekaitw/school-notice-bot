@@ -6,10 +6,10 @@
 2. 透過學校網站的 RSS 訂閱抓取公告列表
 3. 找出「新」公告（不在 last_checked.json 裡的）
 4. 對每則新公告呼叫 Gemini API，判斷是否符合 USER_CRITERIA
-5. 符合的公告先把網址縮短，存進 pending_matches.json（暫存清單），不會馬上發送
+5. 符合的公告不會馬上發送，而是先存進 pending_matches.json（暫存清單）
 6. 只有當這次執行的「台灣時間小時」落在 DIGEST_HOURS 指定的時間點，
-   才會把暫存清單裡累積的所有公告，一次組成一則訊息推播到 LINE 群組，
-   發送完畢後清空暫存清單
+   而且這個時段還沒發送過，才會把暫存清單裡累積的所有公告，
+   一次組成一則訊息推播到 LINE 群組，發送完畢後清空暫存清單
 7. 更新 last_checked.json（交給 GitHub Actions 去 commit）
 
 這個設計讓「多久檢查一次」跟「多久通知一次」分開：
@@ -17,6 +17,11 @@
 RSS 只顯示最新 10 則、公告發布速度快，而漏抓公告；
 但通知本身只會在你指定的時間點（例如早上 6 點、下午 4 點）發送，
 不會因為檢查得勤而變成一直跳訊息轟炸群組。
+
+同時用 state["last_sent_slot"] 記住「這個時段已經發過了」，
+防止 GitHub Actions 排程延遲、把好幾次積欠的執行擠在同一小時內
+連續觸發，導致同一時段被誤判成好幾次獨立發送時機、重複浪費
+LINE 的免費訊息額度——這正是先前一天暴增到十幾則推播的根本原因。
 
 本版針對「臺北市立成功高級中學」設定，直接讀取該校的 RSS 訂閱網址
 （例如 https://www.cksh.tp.edu.tw/category/news/feed/ ），
@@ -220,11 +225,19 @@ def build_digest_message(matched_items: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 # 判斷這次執行是不是「該發送彙整訊息」的時間點
 # ---------------------------------------------------------------------------
-def is_digest_hour(digest_hours_env: str) -> bool:
+def should_send_digest(state: dict, digest_hours_env: str) -> bool:
     """
     DIGEST_HOURS 環境變數格式：逗號分隔的小時數字（台灣時間，24 小時制），
     例如 "6,16" 代表早上 6 點跟下午 4 點。
-    只要目前台灣時間的「小時」落在這個清單裡，這次執行就會發送彙整訊息。
+    只要目前台灣時間的「小時」落在這個清單裡，這次執行就符合發送資格。
+
+    但光靠「現在是幾點」判斷還不夠：如果 GitHub Actions 排程延遲、
+    把好幾次積欠的執行擠在同一小時內連續觸發，會導致同一個時段被
+    誤判成好幾次獨立的發送時機、重複發送好幾次彙整訊息，白白浪費
+    LINE 的免費訊息額度。
+    這裡額外用 state["last_sent_slot"] 記住「這個時段（日期+小時）
+    已經發送過了」，同一時段內只會真的送出第一次，之後重複觸發的
+    都會被這裡擋下來。
     """
     try:
         hours = {int(h.strip()) for h in digest_hours_env.split(",") if h.strip()}
@@ -232,8 +245,16 @@ def is_digest_hour(digest_hours_env: str) -> bool:
         print(f"[警告] DIGEST_HOURS 格式錯誤：{digest_hours_env!r}，本次不發送", file=sys.stderr)
         return False
 
-    current_hour = datetime.now(TAIWAN_TZ).hour
-    return current_hour in hours
+    now = datetime.now(TAIWAN_TZ)
+    if now.hour not in hours:
+        return False
+
+    current_slot = now.strftime("%Y-%m-%d-%H")
+    if state.get("last_sent_slot") == current_slot:
+        print(f"[跳過] {current_slot} 這個時段已經發送過彙整訊息，避免重複推播")
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -281,17 +302,18 @@ def main() -> None:
     # 先把暫存清單存檔，不論這次是不是發送時間點，都要保留累積結果
     save_pending(pending)
 
-    if pending and is_digest_hour(digest_hours_env):
+    if pending and should_send_digest(state, digest_hours_env):
         sent_count = len(pending)
         msg = build_digest_message(pending)
         send_line_message(line_token, line_group, msg)
-        # 發送成功與否都清空暫存清單，避免失敗時卡住不斷重複堆積；
-        # 如果推播真的失敗，send_line_message 會印出錯誤訊息方便排查
         pending = []
         save_pending(pending)
+        # 記住這個時段已經發送過，防止同一小時內被重複觸發時再發一次，
+        # 這是避免額度被異常消耗的根本防護
+        state["last_sent_slot"] = datetime.now(TAIWAN_TZ).strftime("%Y-%m-%d-%H")
         print(f"完成。本次發送彙整訊息，共 {sent_count} 則公告已清空暫存。")
     elif pending:
-        print(f"目前非發送時間點（DIGEST_HOURS={digest_hours_env}），先累積在暫存清單，暫不推播。")
+        print(f"目前非發送時間點或本時段已發送過（DIGEST_HOURS={digest_hours_env}），先累積在暫存清單，暫不推播。")
     else:
         print("暫存清單目前是空的，不推播。")
 
